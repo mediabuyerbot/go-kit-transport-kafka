@@ -2,91 +2,153 @@ package kafkatransport
 
 import (
 	"context"
-	"log"
+
+	"github.com/go-kit/kit/log"
+
+	"github.com/go-kit/kit/transport"
 
 	"github.com/Shopify/sarama"
+	"github.com/go-kit/kit/endpoint"
 )
 
-type ConsumerHandler func(ctx context.Context, message interface{}) error
+type (
+	ConsumerOption      func(*Consumer)
+	ConsumerHook        func(sarama.ConsumerGroupSession) error
+	ConsumerRequestFunc func(context.Context) context.Context
+)
 
 type Consumer struct {
-	topic    string
-	client   sarama.ConsumerGroup
-	handlers []ConsumerHandler
-	dec      DecodeMessageFunc
-}
-
-func (c *Consumer) HandleFunc(handler ConsumerHandler) {
-	c.handlers = append(c.handlers, handler)
+	e              endpoint.Endpoint
+	topic          string
+	client         sarama.ConsumerGroup
+	dec            DecodeMessageFunc
+	errorHandler   transport.ErrorHandler
+	setupHandler   ConsumerHook
+	cleanupHandler ConsumerHook
+	before         []ConsumerRequestFunc
 }
 
 func (c *Consumer) Consume(ctx context.Context) {
-	groupHandler := newNativeHandler(c.handlers, c.dec)
+	groupHandler := newNativeHandler(
+		c.e,
+		c.dec,
+		c.errorHandler,
+		c.setupHandler,
+		c.cleanupHandler,
+		c.before,
+	)
 	go func() {
 		for {
 			if err := c.client.Consume(ctx, []string{c.topic}, groupHandler); err != nil {
-				log.Panicf("Error from consumer: %v", err)
+				c.errorHandler.Handle(ctx, err)
 			}
 			if ctx.Err() != nil {
 				return
 			}
+			groupHandler.ready = make(chan struct{})
 		}
 	}()
 	<-groupHandler.ready
 }
 
+func WithErrorHandler(errorHandler transport.ErrorHandler) ConsumerOption {
+	return func(c *Consumer) { c.errorHandler = errorHandler }
+}
+
+func WithSetupHook(hook ConsumerHook) ConsumerOption {
+	return func(c *Consumer) { c.setupHandler = hook }
+}
+
+func WithCleanupHook(hook ConsumerHook) ConsumerOption {
+	return func(c *Consumer) { c.cleanupHandler = hook }
+}
+
 func NewConsumer(
 	channel string,
+	endpoint endpoint.Endpoint,
 	client sarama.ConsumerGroup,
-	dec DecodeMessageFunc) *Consumer {
+	dec DecodeMessageFunc,
+	options ...ConsumerOption) *Consumer {
 	consumer := &Consumer{
-		dec:      dec,
-		topic:    channel,
-		client:   client,
-		handlers: []ConsumerHandler{},
+		e:              endpoint,
+		dec:            dec,
+		topic:          channel,
+		client:         client,
+		setupHandler:   defaultHookHandler,
+		cleanupHandler: defaultHookHandler,
+		errorHandler:   transport.NewLogErrorHandler(log.NewNopLogger()),
+		before:         []ConsumerRequestFunc{},
+	}
+	for _, option := range options {
+		option(consumer)
 	}
 	return consumer
 }
 
+var defaultHookHandler = func(s sarama.ConsumerGroupSession) error { return nil }
+
 type nativeHandler struct {
-	dec      DecodeMessageFunc
-	ready    chan struct{}
-	handlers []ConsumerHandler
+	dec          DecodeMessageFunc
+	ready        chan struct{}
+	e            endpoint.Endpoint
+	errorHandler transport.ErrorHandler
+	setupHook    ConsumerHook
+	cleanupHook  ConsumerHook
+	inject       []ConsumerRequestFunc
 }
 
 func newNativeHandler(
-	handlers []ConsumerHandler,
+	e endpoint.Endpoint,
 	decoder DecodeMessageFunc,
+	errorHandler transport.ErrorHandler,
+	setupHook ConsumerHook,
+	cleanupHook ConsumerHook,
+	inject []ConsumerRequestFunc,
 ) *nativeHandler {
 	return &nativeHandler{
-		dec:      decoder,
-		handlers: handlers,
-		ready:    make(chan struct{}),
+		setupHook:    setupHook,
+		cleanupHook:  cleanupHook,
+		errorHandler: errorHandler,
+		dec:          decoder,
+		inject:       inject,
+		e:            e,
+		ready:        make(chan struct{}),
 	}
 }
 
 func (h *nativeHandler) Setup(s sarama.ConsumerGroupSession) error {
 	close(h.ready)
-	return nil
+	return h.setupHook(s)
 }
 
-func (h *nativeHandler) Cleanup(sarama.ConsumerGroupSession) error {
-	return nil
+func (h *nativeHandler) Cleanup(s sarama.ConsumerGroupSession) error {
+	return h.cleanupHook(s)
 }
 
 func (h *nativeHandler) ConsumeClaim(session sarama.ConsumerGroupSession,
 	claim sarama.ConsumerGroupClaim) error {
 	ctx := session.Context()
 	for message := range claim.Messages() {
+		for _, f := range h.inject {
+			ctx = f(ctx)
+		}
+
 		request, err := h.dec(ctx, message)
 		if err != nil {
+			h.errorHandler.Handle(ctx, err)
 			return err
 		}
-		for _, handler := range h.handlers {
-			if err := handler(ctx, request); err != nil {
-				return err
-			}
+
+		response, err := h.e(ctx, request)
+		if err != nil {
+			h.errorHandler.Handle(ctx, err)
+			return err
 		}
+		if e, ok := response.(error); ok && len(e.Error()) > 0 {
+			h.errorHandler.Handle(ctx, e)
+			continue
+		}
+		session.MarkMessage(message, "")
 	}
 	return nil
 }
