@@ -27,7 +27,6 @@ func (service) OpenAccount(ctx context.Context, a int, b int) error {
 func main() {
 	config := sarama.NewConfig()
 	config.Version = sarama.V2_1_0_0
-	config.Producer.Return.Successes = true
 	brokers := []string{"127.0.0.1:9092", "127.0.0.1:9093", "127.0.0.1:9094"}
 	client, err := sarama.NewConsumerGroup(brokers, "demo", config)
 	if err != nil {

@@ -63,6 +63,10 @@ func WithCleanupHook(hook ConsumerHook) ConsumerOption {
 	return func(c *Consumer) { c.cleanupHandler = hook }
 }
 
+func ConsumerBefore(before ...ConsumerRequestFunc) ConsumerOption {
+	return func(c *Consumer) { c.before = append(c.before, before...) }
+}
+
 func NewConsumer(
 	channel string,
 	endpoint endpoint.Endpoint,
