@@ -132,11 +132,10 @@ func (h *nativeHandler) Cleanup(s sarama.ConsumerGroupSession) error {
 func (h *nativeHandler) ConsumeClaim(session sarama.ConsumerGroupSession,
 	claim sarama.ConsumerGroupClaim) error {
 	ctx := session.Context()
+	for _, f := range h.inject {
+		ctx = f(ctx)
+	}
 	for message := range claim.Messages() {
-		for _, f := range h.inject {
-			ctx = f(ctx)
-		}
-
 		request, err := h.dec(ctx, message)
 		if err != nil {
 			h.errorHandler.Handle(ctx, err)
